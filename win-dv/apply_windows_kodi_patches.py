@@ -24,6 +24,12 @@ def run_cmd(cmd, cwd=None):
         raise RuntimeError(f"Command failed with exit code {res.returncode}: {' '.join(cmd)}")
 
 
+def replace_required(text: str, old: str, new: str, label: str) -> str:
+    if old not in text:
+        raise RuntimeError(f"Expected pattern not found during {label}:\n{old}")
+    return text.replace(old, new)
+
+
 def integrate(le_repo_dir: str, kodi_dir: str) -> None:
     le_repo_dir = os.path.abspath(le_repo_dir)
     kodi_dir = os.path.abspath(kodi_dir)
@@ -168,6 +174,8 @@ def integrate(le_repo_dir: str, kodi_dir: str) -> None:
         state_cpp = f.read()
     # Adjust relative "../include/..." to direct header names (since cb1/src is in include_directories)
     state_cpp = state_cpp.replace('../include/', '')
+    # Include dvbridge_win_mmio.c inside extern "C" so it shares the C++ PCH cleanly in MSVC
+    state_cpp += '\nextern "C" {\n#include "dvbridge_win_mmio.c"\n}\n'
     with open(
         os.path.join(win_windowing_dir, "DVBridgeStateWin.cpp"),
         "w",
@@ -209,17 +217,21 @@ def integrate(le_repo_dir: str, kodi_dir: str) -> None:
     win_cmake = os.path.join(win_windowing_dir, "CMakeLists.txt")
     with open(win_cmake, "r", encoding="utf-8") as f:
         win_cmake_txt = f.read()
-    win_cmake_txt = win_cmake_txt.replace(
-        "set(SOURCES WinEventsWin32.cpp",
-        "set(SOURCES DVBridgeStateWin.cpp\n            dvbridge_win_mmio.c\n            WinEventsWin32.cpp",
+    win_cmake_txt = replace_required(
+        win_cmake_txt,
+        "set(SOURCES VideoSyncD3D.cpp",
+        "set(SOURCES DVBridgeStateWin.cpp\n            VideoSyncD3D.cpp",
+        "xbmc/windowing/windows/CMakeLists.txt SOURCES",
     )
-    win_cmake_txt = win_cmake_txt.replace(
-        "set(HEADERS WinEventsWin32.h",
-        "set(HEADERS DVBridgeStateWin.h\n            WinEventsWin32.h",
+    win_cmake_txt = replace_required(
+        win_cmake_txt,
+        "set(HEADERS VideoSyncD3D.h",
+        "set(HEADERS DVBridgeStateWin.h\n            VideoSyncD3D.h",
+        "xbmc/windowing/windows/CMakeLists.txt HEADERS",
     )
     with open(win_cmake, "w", encoding="utf-8", newline="\n") as f:
         f.write(win_cmake_txt)
-    print("Added DVBridgeStateWin.cpp and dvbridge_win_mmio.c to xbmc/windowing/windows/CMakeLists.txt")
+    print("Added DVBridgeStateWin.cpp (with dvbridge_win_mmio.c) to xbmc/windowing/windows/CMakeLists.txt")
 
     # 6. Hook CDVBridgeStateWin + StreamTelemetry + SetVideoSourceSideData into RenderManager.cpp on Windows
     render_mgr = os.path.join(
@@ -229,27 +241,33 @@ def integrate(le_repo_dir: str, kodi_dir: str) -> None:
         rm_txt = f.read()
 
     # Add Windows includes at top of RenderManager.cpp
-    rm_txt = rm_txt.replace(
+    rm_txt = replace_required(
+        rm_txt,
         '#if defined(HAVE_GBM) && defined(HAS_GLES)\n#include "windowing/gbm/WinSystemGbmGLESContext.h"\n#endif',
         '#if defined(HAVE_GBM) && defined(HAS_GLES)\n#include "windowing/gbm/WinSystemGbmGLESContext.h"\n'
         '#elif defined(TARGET_WINDOWS)\n'
         '#include "cores/DataCacheCore.h"\n'
+        '#include "cores/VideoSourceSideData.h"\n'
         '#include "cores/VideoPlayer/DVDCodecs/Video/DVStreamTelemetry.h"\n'
         '#include "windowing/windows/DVBridgeStateWin.h"\n'
         '#endif',
+        "RenderManager.cpp includes",
     )
 
     # Hook Configure() to probe Windows GPU & Monitor EDID VSVDB
-    rm_txt = rm_txt.replace(
+    rm_txt = replace_required(
+        rm_txt,
         '#ifdef HAVE_DVBRIDGE\n    m_nativeDVRate = DVBRIDGE::WantsNativeOutput(&picture);\n#endif',
         '#ifdef HAVE_DVBRIDGE\n    m_nativeDVRate = DVBRIDGE::WantsNativeOutput(&picture);\n'
         '#elif defined(TARGET_WINDOWS)\n'
         '    KODI::WINDOWING::WINDOWS::CDVBridgeStateWin::GetInstance().EnsureHardwareProbed();\n'
         '#endif',
+        "RenderManager.cpp Configure()",
     )
 
     # Hook Render() to publish VideoSourceSideData on Windows
-    rm_txt = rm_txt.replace(
+    rm_txt = replace_required(
+        rm_txt,
         '#if defined(HAVE_GBM) && defined(HAS_GLES)\n'
         '    if (auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(\n'
         '            CServiceBroker::GetWinSystem()))\n'
@@ -266,10 +284,12 @@ def integrate(le_repo_dir: str, kodi_dir: str) -> None:
         '      if (const auto& source = m_Queue[m_presentsource].sourceSideData)\n'
         '        CServiceBroker::GetDataCacheCore().SetVideoSourceSideData(source->Generation(), source);\n'
         '#endif',
+        "RenderManager.cpp Render()",
     )
 
     # Hook AddVideoPicture() to pack ETSI GS CCM 001 V1.1.1 metadata and publish StreamTelemetry on Windows
-    rm_txt = rm_txt.replace(
+    rm_txt = replace_required(
+        rm_txt,
         '  SPresent& m = m_Queue[index];\n  m.sourceSideData = picture.sourceSideData;',
         '  SPresent& m = m_Queue[index];\n  m.sourceSideData = picture.sourceSideData;\n'
         '#if defined(TARGET_WINDOWS)\n'
@@ -281,7 +301,7 @@ def integrate(le_repo_dir: str, kodi_dir: str) -> None:
         '    DVBRIDGE::StreamSnapshot::Output out{};\n'
         '    const bool hasVsvdb = winDv.ActiveSink().dvCaps.status == DV_EDID_STANDARD;\n'
         '    out.flags = (hasVsvdb ? CDVPlaybackInfo::HDMI : CDVPlaybackInfo::HDR10) |\n'
-        '                (picture.doviEnhancement ? CDVPlaybackInfo::FEL : 0);\n'
+        '                (picture.strDVELType == "FEL" ? CDVPlaybackInfo::FEL : 0);\n'
         '    out.bits = hasVsvdb ? 12 : 10;\n'
         '    out.target = 1000.0f;\n'
         '    out.effective = hasVsvdb ? 1 : 5;\n'
@@ -292,6 +312,7 @@ def integrate(le_repo_dir: str, kodi_dir: str) -> None:
         '    DVBRIDGE::StreamTelemetry::PublishNativeInfo(picture.doviSourceInfo.informationGeneration);\n'
         '  }\n'
         '#endif',
+        "RenderManager.cpp AddVideoPicture()",
     )
 
     with open(render_mgr, "w", encoding="utf-8", newline="\n") as f:

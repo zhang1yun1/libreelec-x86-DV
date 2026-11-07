@@ -20,13 +20,12 @@ extern "C" {
 #include <windows.h>
 #include <setupapi.h>
 #include <dxgi1_6.h>
-#include <initguid.h>
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "advapi32.lib")
 
-DEFINE_GUID(GUID_DEVINTERFACE_MONITOR_WIN_DV,
-            0xe6f07b5f, 0xee97, 0x4a90, 0xb0, 0x76, 0x33, 0xf5, 0x7b, 0xf4, 0xea, 0xa7);
+static const GUID GUID_DEVINTERFACE_MONITOR_WIN_DV = {
+    0xe6f07b5f, 0xee97, 0x4a90, {0xb0, 0x76, 0x33, 0xf5, 0x7b, 0xf4, 0xea, 0xa7}};
 #endif
 
 namespace KODI::WINDOWING::WINDOWS
