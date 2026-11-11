@@ -1,0 +1,157 @@
+name: Build Kodi 22 Windows x64 Installer (CB1 + Dolby Vision)
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish built Windows .exe installer to GitHub Releases"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-x64:
+    name: Build Kodi 22 Piers + CB1 + DVBridge (Windows x64)
+    runs-on: windows-2022
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout libreelec-x86-DV repository
+        uses: actions/checkout@v4
+        with:
+          path: le-repo
+
+      - name: Verify NSIS (makensis) and Build Tools
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing NSIS via Chocolatey..."
+            choco install nsis -y --no-progress
+          }
+          $nsisPath = "C:\Program Files (x86)\NSIS"
+          if (Test-Path $nsisPath) {
+            Add-Content -Path $env:GITHUB_PATH -Value $nsisPath
+          }
+          cmake --version
+          java -version
+          git --version
+
+      - name: Compile win-dv-tool.exe & Run ETSI GS CCM 001 V1.1.1 Self-Test
+        shell: pwsh
+        run: |
+          $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          if (-not (Test-Path $csc)) { throw "csc.exe not found at $csc" }
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\win-dv-out" | Out-Null
+          & $csc /nologo /optimize+ /r:System.Drawing.dll `
+            "/out:$env:GITHUB_WORKSPACE\win-dv-out\win-dv-tool.exe" `
+            "$env:GITHUB_WORKSPACE\le-repo\win-dv\src\WinDvTool.cs"
+          & "$env:GITHUB_WORKSPACE\win-dv-out\win-dv-tool.exe" --test-only
+
+      - name: Clone Upstream xbmc/xbmc at Kodi 22 Piers (28ea2eac1eb7af8fdcbd2672d933ce87f594be79)
+        shell: pwsh
+        run: |
+          if (Test-Path "C:\kodi-src") { Remove-Item -Recurse -Force "C:\kodi-src" }
+          git init C:\kodi-src
+          git -C C:\kodi-src remote add origin https://github.com/xbmc/xbmc.git
+          git -C C:\kodi-src fetch --depth 1 origin 28ea2eac1eb7af8fdcbd2672d933ce87f594be79
+          git -C C:\kodi-src checkout -B cb1-windows FETCH_HEAD
+
+      - name: Apply CB1 + DVBridge + 3D MVC Patches & Windows Hardware Integration
+        shell: pwsh
+        run: |
+          python "$env:GITHUB_WORKSPACE\le-repo\win-dv\apply_windows_kodi_patches.py" `
+            "$env:GITHUB_WORKSPACE\le-repo" "C:\kodi-src"
+          git -C C:\kodi-src config user.name "CB1 Windows Builder"
+          git -C C:\kodi-src config user.email "actions@github.com"
+          git -C C:\kodi-src add -A
+          git -C C:\kodi-src commit -m "Kodi 22 Piers + CB1 + DVBridge Windows x64 Integration"
+
+      - name: Download Kodi Windows x64 Prebuilt Dependencies & MSYS2
+        shell: cmd
+        run: |
+          cd /d C:\kodi-src\tools\buildsteps\windows\x64
+          set USE_LESSMSI=YES
+          call download-dependencies.bat
+          if errorlevel 1 exit /b 1
+          call download-msys2.bat sh
+          if errorlevel 1 exit /b 1
+
+      - name: Build Kodi 22 Windows x64, Patched FFmpeg 9.0.2 & Generate NSIS Installer (.exe)
+        shell: cmd
+        run: |
+          cd /d C:\kodi-src\tools\buildsteps\windows\x64
+          call BuildSetup.bat noprompt nobinaryaddons sh clean
+          if errorlevel 1 (
+            echo BuildSetup.bat returned non-zero, checking if FFmpeg and KodiSetup installer or kodi.exe were produced...
+          )
+          findstr /C:"dvbridge_raw_magic" C:\kodi-src\project\BuildDependencies\mingwlibs\x64\include\libavutil\dovi_meta.h
+          if errorlevel 1 (
+            echo ERROR: CB1 patched dovi_meta.h not found in mingwlibs\x64\include!
+            exit /b 1
+          )
+
+      - name: Collect Built Installer & Package Artifacts
+        shell: pwsh
+        run: |
+          $outDir = "$env:GITHUB_WORKSPACE\release-assets"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          Copy-Item "$env:GITHUB_WORKSPACE\win-dv-out\win-dv-tool.exe" "$outDir\win-dv-tool.exe" -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\le-repo\win-dv\README_WINDOWS_PORT.md" "$outDir\README_WINDOWS_PORT.md" -Force
+
+          $installers = Get-ChildItem -Path "C:\kodi-src\project\Win32BuildSetup" -Filter "KodiSetup-*.exe" -ErrorAction SilentlyContinue
+          if ($installers) {
+            foreach ($inst in $installers) {
+              Write-Host "Found NSIS Installer: $($inst.FullName)"
+              Copy-Item $inst.FullName "$outDir\KodiSetup-22.0-Piers-CB1-DolbyVision-x64.exe" -Force
+            }
+          } else {
+            Write-Host "Checking C:\kodi-src\kodi-build\Release for kodi.exe..."
+            $kodiExe = Get-ChildItem -Path "C:\kodi-src" -Recurse -Filter "kodi.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $kodiExe) {
+              Get-ChildItem -Path "C:\kodi-src\project\Win32BuildSetup" -ErrorAction SilentlyContinue | Format-Table Name, Length
+              throw "Neither KodiSetup-*.exe nor kodi.exe was found!"
+            }
+            Write-Host "Found kodi.exe at $($kodiExe.FullName), creating portable ZIP archive..."
+            $pkgDir = "C:\kodi-src\project\Win32BuildSetup\BUILD_WIN32"
+            if (Test-Path $pkgDir) {
+              Copy-Item "$env:GITHUB_WORKSPACE\win-dv-out\win-dv-tool.exe" "$pkgDir\win-dv-tool.exe" -Force
+              7z a -tzip "$outDir\Kodi-22.0-Piers-CB1-DolbyVision-x64-Portable.zip" "$pkgDir\*"
+            }
+          }
+
+          Get-ChildItem -Path $outDir | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)" | Out-File -Append -Encoding ascii "$outDir\SHA256SUMS.txt"
+          }
+          Get-Content "$outDir\SHA256SUMS.txt"
+
+      - name: Upload Windows Installer Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kodi-22-CB1-DolbyVision-Windows-x64
+          path: ${{ github.workspace }}/release-assets/*
+          retention-days: 30
+
+      - name: Publish to GitHub Releases
+        if: ${{ github.event.inputs.publish_release != 'false' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "win-x64-cb1-dv"
+          $title = "Kodi 22.0 (Piers) + CB1 Dolby Vision Windows x64 Installer"
+          $notes = 'Automated Windows x64 build of Kodi 22.0 (Piers) integrated with CB1 Dolby Vision (Profile 5/7/8, CM v2.9/v4.0, FEL/MEL), HDR10+, 3D MVC, TrueHD Atmos / DTS:X telemetry, and Windows Native HDMI Dolby Vision Hardware Bridge (CDVBridgeStateWin + win-dv-tool.exe).'
+          $releaseFiles = Get-ChildItem -Path "$env:GITHUB_WORKSPACE\release-assets\*" | ForEach-Object { $_.FullName }
+          gh release view $tag --repo ${{ github.repository }} 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $releaseFiles --clobber --repo ${{ github.repository }}
+          } else {
+            gh release create $tag $releaseFiles --title $title --notes $notes --repo ${{ github.repository }}
+          }
