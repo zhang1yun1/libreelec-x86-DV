@@ -9,10 +9,12 @@
 #include "DVDDemuxFFmpeg.h"
 
 #include "DVDDemuxUtils.h"
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
 #include "BlurayDovi.h"
 #include "cores/VideoPlayer/DVDStreamInfo.h"
+#ifdef HAVE_DVBRIDGE
 #include "cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h"
+#endif
 extern "C"
 {
 #include "dvbridge_fel_seek.h"
@@ -761,7 +763,7 @@ bool CDVDDemuxFFmpeg::Open(const std::shared_ptr<CDVDInputStream>& pInput, bool 
 
 void CDVDDemuxFFmpeg::Dispose()
 {
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
   m_blurayDovi.reset();
   m_blurayBase = m_blurayEnhancement = -1;
 #endif
@@ -802,7 +804,7 @@ bool CDVDDemuxFFmpeg::Reset()
 
 void CDVDDemuxFFmpeg::Flush()
 {
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
   if (m_blurayDovi)
     m_blurayDovi->Reset(true);
 #endif
@@ -1148,7 +1150,7 @@ DemuxPacket* CDVDDemuxFFmpeg::ReadInternal(bool keep)
 
         // timeout reads after 100ms
         m_timeout.Set(20s);
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
         m_pkt.result = m_blurayDovi ? ReadBlurayDovi(&m_pkt.pkt) :
             av_read_frame(m_pFormatContext, &m_pkt.pkt);
 #else
@@ -1197,12 +1199,12 @@ DemuxPacket* CDVDDemuxFFmpeg::ReadInternal(bool keep)
                          0);
 
           // update streams
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
           const bool wasJoined = bool(m_blurayDovi);
 #endif
           CreateStreams(m_program);
 
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
           if (!wasJoined && m_blurayDovi)
           {
             // Start at a complete pair; never expose a saved raw layer as joined video.
@@ -1497,12 +1499,16 @@ bool CDVDDemuxFFmpeg::SeekTime(double time, bool backwards, double* startpts)
     }
     else
     {
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
       if (m_blurayDovi) m_blurayDovi->Reset(true);
       int64_t layerPosition = -1;
       // Preserve the requested startpts while seeking to a shared layer anchor.
       if (!m_checkTransportStream && m_seekStream == -1)
       {
+#if !defined(HAVE_DVBRIDGE)
+        const auto component = CServiceBroker::GetSettingsComponent();
+        const auto settings = component ? component->GetSettings() : nullptr;
+#endif
         for (const auto& [id, stream] : m_streams)
         {
           if (stream->type != StreamType::VIDEO || id < 0 ||
@@ -1510,7 +1516,12 @@ bool CDVDDemuxFFmpeg::SeekTime(double time, bool backwards, double* startpts)
             continue;
           CDVDStreamInfo hints(*stream);
           if (hints.dovi.dv_profile != 7 || !hints.dovi.el_present_flag ||
+#ifdef HAVE_DVBRIDGE
               (!m_blurayDovi && !DVBRIDGE::RetainsDVSource(hints)))
+#else
+              (!m_blurayDovi && settings &&
+               !settings->GetBool(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONOUTPUT)))
+#endif
             continue;
           AVStream* video = m_pFormatContext->streams[id];
           const int64_t target = av_rescale_q(seek_pts, AV_TIME_BASE_Q, video->time_base);
@@ -1612,7 +1623,7 @@ bool CDVDDemuxFFmpeg::SeekByte(int64_t pos)
   if (ret >= 0)
   {
     m_currentPts = DVD_NOPTS_VALUE;
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
     if (m_blurayDovi) m_blurayDovi->Reset(true);
 #endif
   }
@@ -1739,7 +1750,7 @@ double CDVDDemuxFFmpeg::SelectAspect(AVStream* st, bool& forced)
 
 void CDVDDemuxFFmpeg::CreateStreams(unsigned int program)
 {
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
   InitBlurayDovi(program);
 #endif
   // changes must keep increasing across rebuilds; consumers detect a rebuild by comparing values
@@ -1801,7 +1812,7 @@ void CDVDDemuxFFmpeg::CreateStreams(unsigned int program)
       {
         m_pFormatContext->streams[i]->discard = AVDISCARD_NONE;
         if (GetStream(i) == nullptr
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
             && static_cast<int>(i) != m_blurayEnhancement && static_cast<int>(i) != m_blurayBase
 #endif
         )
@@ -1963,13 +1974,13 @@ void CDVDDemuxFFmpeg::DisposeStreams()
 
 CDemuxStream* CDVDDemuxFFmpeg::AddStream(int streamIdx)
 {
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
   // The admitted EL feeds the joined BL stream, not a selectable second video.
   if (m_blurayDovi && streamIdx == m_blurayEnhancement)
     return nullptr;
 #endif
   AVStream* pStream = m_pFormatContext->streams[streamIdx];
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
   // In-band HEVC headers are extracted by ParsePacket before native stream selection.
   if (m_blurayDovi && streamIdx == m_blurayBase && !pStream->codecpar->extradata)
     return nullptr;
@@ -2412,7 +2423,7 @@ CDemuxStream* CDVDDemuxFFmpeg::AddStream(int streamIdx)
       // This is not used by streaming services and devices (ATV, Nvidia Shield, XONE).
       if (pStream->id == 0x1015)
       {
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
         if (streamIdx != m_blurayEnhancement)
 #endif
         {
@@ -2502,7 +2513,7 @@ void CDVDDemuxFFmpeg::AddStream(int streamIdx, CDemuxStream* stream)
   {
     /* was new stream */
     stream->uniqueId = streamIdx;
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
     // The joined BL can be admitted after Kodi's initial stream inventory.
     if (m_blurayDovi && streamIdx == m_blurayBase)
       stream->source = STREAM_SOURCE_NONE;
@@ -2634,7 +2645,7 @@ std::string CDVDDemuxFFmpeg::GetStreamCodecName(int iStreamId)
 
 bool CDVDDemuxFFmpeg::IsProgramChange()
 {
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
   unsigned groups = 0;
   for (unsigned i = 0; i < m_pFormatContext->nb_stream_groups; ++i)
     groups += m_pFormatContext->stream_groups[i]->type == AV_STREAM_GROUP_PARAMS_DOLBY_VISION;
@@ -2677,7 +2688,7 @@ bool CDVDDemuxFFmpeg::IsProgramChange()
   for (unsigned int i = 0; i < m_pFormatContext->programs[m_program]->nb_stream_indexes; i++)
   {
       int idx = m_pFormatContext->programs[m_program]->stream_index[i];
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
       if (idx == m_blurayEnhancement || (idx == m_blurayBase && !GetStream(idx)))
         continue;
 #endif
@@ -2979,7 +2990,7 @@ void CDVDDemuxFFmpeg::ParsePacket(AVPacket* pkt)
 
     CDemuxStream* stream = GetStream(st->index);
     if (!stream)
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
       if (!m_blurayDovi || st->index != m_blurayBase)
 #endif
       return;
@@ -3224,7 +3235,7 @@ void CDVDDemuxFFmpeg::GetL16Parameters(int &channels, int &samplerate)
   }
 }
 
-#ifdef HAVE_DVBRIDGE
+#if defined(HAVE_DVBRIDGE) || defined(TARGET_WINDOWS)
 void CDVDDemuxFFmpeg::InitBlurayDovi(unsigned int program)
 {
   const bool bluray = m_pInput->IsStreamType(DVDSTREAM_TYPE_BLURAY);
@@ -3297,7 +3308,11 @@ void CDVDDemuxFFmpeg::InitBlurayDovi(unsigned int program)
   }
   const auto component = CServiceBroker::GetSettingsComponent();
   const auto settings = component ? component->GetSettings() : nullptr;
+#ifdef HAVE_DVBRIDGE
   if (settings && settings->GetInt("dvbridge.outputmode") == 2)
+#else
+  if (settings && !settings->GetBool(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONOUTPUT))
+#endif
   {
     report("output-disabled");
     return;
