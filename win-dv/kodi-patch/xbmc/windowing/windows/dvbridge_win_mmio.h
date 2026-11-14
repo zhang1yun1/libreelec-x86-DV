@@ -231,7 +231,9 @@ static inline void dvbridge_win_pack_avi_infoframe(
  * ============================================================================ */
 
 #define AMD_DCN_SEG2_DWORD_BASE             0x000034C0U
+#define AMD_DCN_SEG3_DWORD_BASE             0x00009000U
 #define AMD_DCN_REG_BYTE_OFFSET(dword_reg)  ((AMD_DCN_SEG2_DWORD_BASE + (uint32_t)(dword_reg)) * 4U)
+#define AMD_DCN_SEG3_BYTE_OFFSET(dword_reg) ((AMD_DCN_SEG3_DWORD_BASE + (uint32_t)(dword_reg)) * 4U)
 
 /* Output Pixel Processor (OPP) / Formatter (FMT0..FMT3): Truncate to 8bpc & Disable Dithering */
 #define AMD_DCN_MAX_PIPES                   4U
@@ -251,9 +253,19 @@ static inline void dvbridge_win_pack_avi_infoframe(
 #define   AMD_FMT_TEMPORAL_DITHER_EN_MASK   0x00010000U
 #define   AMD_FMT_ALL_DITHER_TRUNC_MASK     0x0001FF33U
 
-/* Video Packet Generator (VPG0..VPG4) in DCN 3.0 / 3.1 / 3.1.2 / 3.1.4 / 3.2 / 3.5 / 4.01 */
+/* OPTC/ODM & OTG source/master-enable registers (shared across DCN 3.x / 4.01) */
+#define AMD_REG_ODM_OPTC_DATA_SOURCE(otg)   AMD_DCN_REG_BYTE_OFFSET(0x1ACBU + (uint32_t)(otg) * 0x10U)
+#define   AMD_OPTC_SEG0_SRC_SEL_SHIFT       16U
+#define   AMD_OPTC_SEG0_SRC_SEL_MASK        0x000F0000U
+#define AMD_REG_OTG_CONTROL_A(otg)          AMD_DCN_REG_BYTE_OFFSET(0x1B41U + (uint32_t)(otg) * 0x80U) /* DCN 3.0-3.2 */
+#define AMD_REG_OTG_CONTROL_C(otg)          AMD_DCN_REG_BYTE_OFFSET(0x1B43U + (uint32_t)(otg) * 0x80U) /* DCN 3.5-4.1 */
+#define   AMD_OTG_MASTER_EN_MASK            0x00000001U
+
+/* Video Packet Generator (VPG0..VPG3) in DCN 3.0..3.2 (stride 0x100) and DCN 3.5..4.1 (stride 0x124) */
 #define AMD_DCN3_VPG_DWORD_STRIDE           0x0100U
-#define AMD_REG_DCN3_VPG_ACCESS_CTRL(inst)  AMD_DCN_REG_BYTE_OFFSET(0x2068U + (uint32_t)(inst) * AMD_DCN3_VPG_DWORD_STRIDE)
+#define AMD_DCN3_C_VPG_DWORD_STRIDE         0x0124U
+#define AMD_REG_DCN3_VPG_ACCESS_CTRL_S(inst, stride) AMD_DCN_REG_BYTE_OFFSET(0x2068U + (uint32_t)(inst) * (uint32_t)(stride))
+#define AMD_REG_DCN3_VPG_ACCESS_CTRL(inst)  AMD_REG_DCN3_VPG_ACCESS_CTRL_S(inst, AMD_DCN3_VPG_DWORD_STRIDE)
 #define AMD_REG_DCN3_VPG_PACKET_DATA(inst)  AMD_DCN_REG_BYTE_OFFSET(0x2069U + (uint32_t)(inst) * AMD_DCN3_VPG_DWORD_STRIDE)
 #define AMD_REG_DCN3_VPG_FRAME_UPDATE(inst) AMD_DCN_REG_BYTE_OFFSET(0x206AU + (uint32_t)(inst) * AMD_DCN3_VPG_DWORD_STRIDE)
 #define AMD_REG_DCN3_VPG_IMMED_UPDATE(inst) AMD_DCN_REG_BYTE_OFFSET(0x206BU + (uint32_t)(inst) * AMD_DCN3_VPG_DWORD_STRIDE)
@@ -261,7 +273,9 @@ static inline void dvbridge_win_pack_avi_infoframe(
 
 /* DIG Stream Encoder (DIG0..DIG4) across DCN 3.x / 4.01 generations */
 #define AMD_DCN3_DIG_DWORD_STRIDE           0x0100U
-#define AMD_DCN3_DIG_REG_OFFSET(dig, dw)    AMD_DCN_REG_BYTE_OFFSET((uint32_t)(dw) + (uint32_t)(dig) * AMD_DCN3_DIG_DWORD_STRIDE)
+#define AMD_DCN3_C_DIG_DWORD_STRIDE         0x0124U
+#define AMD_DCN3_DIG_REG_OFFSET_S(dig, dw, stride) AMD_DCN_REG_BYTE_OFFSET((uint32_t)(dw) + (uint32_t)(dig) * (uint32_t)(stride))
+#define AMD_DCN3_DIG_REG_OFFSET(dig, dw)    AMD_DCN3_DIG_REG_OFFSET_S(dig, dw, AMD_DCN3_DIG_DWORD_STRIDE)
 /* Layout A: DCN 3.0 / 3.1 / 3.1.2 (Rembrandt) / 3.1.5 / 3.1.6 */
 #define AMD_DCN3_A_DIG0_FE_CNTL             0x208BU
 #define AMD_DCN3_A_DIG0_HDMI_CTRL           0x2093U
@@ -272,11 +286,24 @@ static inline void dvbridge_win_pack_avi_infoframe(
 #define AMD_DCN3_B_DIG0_HDMI_CTRL           0x2094U
 #define AMD_DCN3_B_DIG0_HDMI_GEN_CTRL0      0x209BU
 #define AMD_DCN3_B_DIG0_BE_CNTL             0x20B1U
-/* Layout C: DCN 3.5 / 3.5.1 (890M Strix) / 3.6 / 4.01 / 4.1 (RX 9000) */
+/* Layout C: DCN 3.5 / 3.5.1 (890M Strix) / 3.6 / 4.01 / 4.1 (RX 9000), stride 0x124 */
 #define AMD_DCN3_C_DIG0_FE_CNTL             0x2093U
+#define AMD_DCN3_C_DIG0_FE_CLK_CNTL         0x2094U /* bit4: DIG_FE_CLK_EN */
+#define AMD_DCN3_C_DIG0_FE_EN_CNTL          0x2095U /* bit0: DIG_FE_ENABLE */
 #define AMD_DCN3_C_DIG0_HDMI_CTRL           0x209EU
 #define AMD_DCN3_C_DIG0_HDMI_GEN_CTRL0      0x20A5U
-#define AMD_DCN3_C_DIG0_BE_CNTL             0x20BCU
+#define AMD_DCN3_C_DIG0_BE_CLK_CNTL         0x20BBU /* bits2:0: DIG_BE_MODE, bit4: DIG_BE_CLK_EN */
+#define AMD_DCN3_C_DIG0_BE_CNTL             0x20BCU /* bits14:8: DIG_FE_SOURCE_SELECT */
+#define AMD_DCN3_C_DIG0_BE_EN_CNTL          0x20BDU /* bit0: DIG_BE_ENABLE */
+
+/* HPO FRL Stream Encoder (HDMI 2.1 FRL) + dedicated SEG3 VPG across DCN 3.0..4.1 */
+#define AMD_REG_DCN_HPO_STREAM_CLK_CTRL     AMD_DCN_SEG3_BYTE_OFFSET(0x08D3U) /* bit0: CLOCK_EN */
+#define AMD_REG_DCN_HPO_STREAM_MUX_CTRL     AMD_DCN_SEG3_BYTE_OFFSET(0x08D5U) /* bits2:0: OTG source */
+#define AMD_REG_DCN_HPO_TB_ENC_CTRL         AMD_DCN_SEG3_BYTE_OFFSET(0x08DFU) /* bit0: HDMI_TB_ENC_EN */
+#define AMD_REG_DCN_HPO_TB_GEN_CTRL0        AMD_DCN_SEG3_BYTE_OFFSET(0x08E6U)
+#define AMD_REG_DCN_HPO_TB_PKT0_1_LINE      AMD_DCN_SEG3_BYTE_OFFSET(0x08E9U)
+#define AMD_REG_DCN_HPO_TB_PKT4_5_LINE      AMD_DCN_SEG3_BYTE_OFFSET(0x08EBU)
+#define AMD_REG_DCN_HPO_VPG_ACCESS_CTRL     AMD_DCN_SEG3_BYTE_OFFSET(0x0931U)
 
 #define AMD_REG_DCN3_HDMI_GEN_CTRL0(inst)   AMD_DCN3_DIG_REG_OFFSET(inst, AMD_DCN3_A_DIG0_HDMI_GEN_CTRL0)
 #define AMD_REG_DCN3_HDMI_GEN_CTRL1(inst)   AMD_DCN3_DIG_REG_OFFSET(inst, AMD_DCN3_A_DIG0_HDMI_GEN_CTRL0 + 4U)
@@ -310,6 +337,23 @@ struct dvbridge_mmio_ops {
 void dvbridge_win_intel_apply_dv(
     const struct dvbridge_mmio_ops *ops,
     unsigned pipe_idx,
+    bool enable_dv,
+    bool legacy_vsif,
+    uint8_t cta_vic);
+
+/* Exact MMIO byte offsets for an active AMD DCN DIO DIG or HPO FRL output */
+struct dvbridge_amd_dcn_params {
+    uint32_t fmt_bit_depth_reg;
+    uint32_t vpg_access_reg;
+    uint32_t gen_ctrl0_reg;
+    uint32_t pkt01_line_reg;
+    uint32_t pkt45_line_reg;
+};
+
+/* Apply or disable TV-Led Dolby Vision using resolved AMD DCN register byte offsets */
+void dvbridge_win_amd_dcn_apply_params(
+    const struct dvbridge_mmio_ops *ops,
+    const struct dvbridge_amd_dcn_params *params,
     bool enable_dv,
     bool legacy_vsif,
     uint8_t cta_vic);

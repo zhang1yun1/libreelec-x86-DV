@@ -990,6 +990,9 @@ void DX::DeviceResources::HandleDeviceLost(bool removed)
 
 bool DX::DeviceResources::Begin()
 {
+  if (!m_swapChain)
+    return false;
+
   HRESULT hr = m_swapChain->Present(0, DXGI_PRESENT_TEST);
 
   // If the device was removed either by a disconnection or a driver upgrade, we
@@ -1006,6 +1009,9 @@ bool DX::DeviceResources::Begin()
       CreateWindowSizeDependentResources();
     }
   }
+
+  if (!m_swapChain || !m_backBufferTex.GetRenderTarget())
+    return false;
 
   m_deferrContext->OMSetRenderTargets(1, m_backBufferTex.GetAddressOfRTV(), m_d3dDepthStencilView.Get());
 
@@ -1029,6 +1035,9 @@ void DX::DeviceResources::Present()
     return;
 #endif
 
+  if (!m_swapChain)
+    return;
+
   // The first argument instructs DXGI to block until VSync, putting the application
   // to sleep until the next VSync. This ensures we don't waste any cycles rendering
   // frames that will never be displayed to the screen.
@@ -1050,7 +1059,7 @@ void DX::DeviceResources::Present()
     }
   }
 
-  if (m_d3dContext == m_deferrContext)
+  if (m_d3dContext == m_deferrContext && m_backBufferTex.GetRenderTarget())
   {
     m_deferrContext->OMSetRenderTargets(1, m_backBufferTex.GetAddressOfRTV(), m_d3dDepthStencilView.Get());
   }

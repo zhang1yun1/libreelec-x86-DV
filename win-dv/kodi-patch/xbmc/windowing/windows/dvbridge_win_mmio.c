@@ -134,21 +134,20 @@ void dvbridge_win_intel_apply_dv(
 }
 
 /*
- * Write a 9-dword (36-byte) HDMI Generic InfoFrame packet into an AMD DCN 3.x VPG
+ * Write a 9-dword (36-byte) HDMI Generic InfoFrame packet into an AMD DCN 3.x/4.x VPG
  * (Video Packet Generator) slot (`slot_idx`: 0=AVI, 1=Vendor/Dolby VSIF, 4=HDRSMD)
  * and trigger an immediate GSP packet update (`VPG_GSP_IMMEDIATE_UPDATE_CTRL`).
  */
-static void amd_dcn3_vpg_write_packet(
+static void amd_dcn_vpg_write_packet(
     const struct dvbridge_mmio_ops *ops,
-    unsigned vpg_inst,
+    uint32_t access_reg,
     unsigned slot_idx,
     const struct dvbridge_hw_infoframe *pkt,
     bool immediate_update)
 {
-    uint32_t access_reg = AMD_REG_DCN3_VPG_ACCESS_CTRL(vpg_inst);
-    uint32_t data_reg   = AMD_REG_DCN3_VPG_PACKET_DATA(vpg_inst);
-    uint32_t immed_reg  = AMD_REG_DCN3_VPG_IMMED_UPDATE(vpg_inst);
-    uint32_t frame_reg  = AMD_REG_DCN3_VPG_FRAME_UPDATE(vpg_inst);
+    uint32_t data_reg   = access_reg + 4U;
+    uint32_t frame_reg  = access_reg + 8U;
+    uint32_t immed_reg  = access_reg + 12U;
 
     /* VPG_GENERIC_PACKET_ACCESS_CTRL: VPG_GENERIC_DATA_INDEX = slot_idx * 9 */
     ops->write32(ops->user_ctx, access_reg, slot_idx * 9U);
@@ -170,36 +169,35 @@ static void amd_dcn3_vpg_write_packet(
 }
 
 /*
- * AMD DCN 3.0 / 3.1 / 3.1.2 (Rembrandt) / 3.1.4 / 3.2 / 3.5 / 4.01:
+ * AMD DCN 3.0 .. DCN 4.01 (both DIO TMDS via DIG/VPG and HDMI 2.1 FRL via HPO/VPG):
  *
- * When TV-Led Dolby Vision is enabled on pipe/stream encoder `pipe_idx`:
- * 1. FMT_BIT_DEPTH_CONTROL(pipe_idx):
- *    - Clear FMT_TRUNCATE_EN, FMT_SPATIAL_DITHER_EN, FMT_TEMPORAL_DITHER_EN
- *      so the 24-bit RGB8 Dolby Vision tunnel + embedded CRC-16 metadata arrives
- *      at the HDMI sink bit-perfectly.
- * 2. VPG(pipe_idx):
+ * When TV-Led Dolby Vision is enabled:
+ * 1. FMT_BIT_DEPTH_CONTROL(fmt_idx):
+ *    - Enable 8bpc truncation and clear spatial/temporal dithering so the 24-bit RGB8
+ *      Dolby Vision tunnel + embedded CRC-16 arrives at the HDMI sink bit-perfectly.
+ * 2. VPG(vpg_access_reg):
  *    - Program slot 1 (`AMD_DCN3_PKT_SLOT_VENDOR`, offset `1 * 9 = 9`) with the
  *      9-dword Dolby Vision VSIF (`DW0=0x001B0181, DW1=0x00D0464B, DW2=0x00000002`).
  *    - Program slot 0 (`AMD_DCN3_PKT_SLOT_AVI`, offset `0`) with the RGB Full-Range
  *      AVI InfoFrame.
  *    - Clear slot 4 (`AMD_DCN3_PKT_SLOT_HDRSMD`, offset `4 * 9 = 36`) so HDR10 Static
  *      Metadata is not transmitted simultaneously.
- * 3. DIG_HDMI_GENERIC_PACKET_CONTROL0 & CONTROL1(pipe_idx):
+ * 3. HDMI_GENERIC_PACKET_CONTROL0 / HDMI_TB_ENC_GENERIC_PACKET_CONTROL0 + line regs:
  *    - Enable continuous transmission of Generic0 (AVI: bits 1:0 = 0x3) and
- *      Generic1 (Vendor/Dolby VSIF: bits 5:4 = 0x30) on Line 2 (CONTROL1 bits 31:16 = 2).
+ *      Generic1 (Vendor/Dolby VSIF: bits 5:4 = 0x30) on Line 2 (bits 31:16 = 2).
  *    - Disable Generic4 (HDRSMD: bits 17:16 = 0).
  */
-void dvbridge_win_amd_dcn3_apply_dv_ex(
+void dvbridge_win_amd_dcn_apply_params(
     const struct dvbridge_mmio_ops *ops,
-    unsigned dig_idx,
-    unsigned fmt_idx,
-    uint32_t gen_ctrl0_dword,
+    const struct dvbridge_amd_dcn_params *params,
     bool enable_dv,
     bool legacy_vsif,
     uint8_t cta_vic)
 {
-    if (!ops || !ops->read32 || !ops->write32 ||
-        dig_idx >= AMD_DCN_MAX_DIGS || fmt_idx >= AMD_DCN_MAX_PIPES)
+    if (!ops || !ops->read32 || !ops->write32 || !params ||
+        params->fmt_bit_depth_reg == 0U || params->vpg_access_reg == 0U ||
+        params->gen_ctrl0_reg == 0U || params->pkt01_line_reg == 0U ||
+        params->pkt45_line_reg == 0U)
         return;
 
     struct dvbridge_hw_infoframe vsif;
@@ -209,52 +207,69 @@ void dvbridge_win_amd_dcn3_apply_dv_ex(
     dvbridge_win_pack_avi_infoframe(&avi, cta_vic, legacy_vsif);
 
     /* 1. Configure OPP/FMT for 8bpc truncation (DITHER_OPTION_TRUN8) with dithering disabled */
-    uint32_t fmt_reg = AMD_REG_FMT_BIT_DEPTH_CONTROL(fmt_idx);
-    uint32_t fmt_val = ops->read32(ops->user_ctx, fmt_reg);
     if (enable_dv) {
+        uint32_t fmt_val = ops->read32(ops->user_ctx, params->fmt_bit_depth_reg);
         fmt_val &= ~AMD_FMT_ALL_DITHER_TRUNC_MASK;
         fmt_val |= (AMD_FMT_TRUNCATE_EN_MASK | AMD_FMT_TRUNCATE_DEPTH_8BPC);
-        ops->write32(ops->user_ctx, fmt_reg, fmt_val);
+        ops->write32(ops->user_ctx, params->fmt_bit_depth_reg, fmt_val);
     }
 
-    /* 2. Program VPG packet memory and DIG HDMI Generic Packet Control */
-    if (gen_ctrl0_dword == 0U)
-        gen_ctrl0_dword = AMD_DCN3_A_DIG0_HDMI_GEN_CTRL0;
-
-    uint32_t ctrl0_reg = AMD_DCN3_DIG_REG_OFFSET(dig_idx, gen_ctrl0_dword);
-    uint32_t ctrl1_reg = AMD_DCN3_DIG_REG_OFFSET(dig_idx, gen_ctrl0_dword + 4U);
-    uint32_t ctrl2_reg = AMD_DCN3_DIG_REG_OFFSET(dig_idx, gen_ctrl0_dword + 5U);
-
-    uint32_t ctrl0 = ops->read32(ops->user_ctx, ctrl0_reg);
-    uint32_t ctrl1 = ops->read32(ops->user_ctx, ctrl1_reg);
-    uint32_t ctrl2 = ops->read32(ops->user_ctx, ctrl2_reg);
+    /* 2. Program VPG packet memory and Generic Packet Control / Line registers */
+    uint32_t ctrl0 = ops->read32(ops->user_ctx, params->gen_ctrl0_reg);
+    uint32_t line45 = ops->read32(ops->user_ctx, params->pkt45_line_reg);
 
     if (enable_dv) {
-        /* Write AVI InfoFrame to slot 0 and Dolby VSIF to slot 1 */
-        amd_dcn3_vpg_write_packet(ops, dig_idx, AMD_DCN3_PKT_SLOT_AVI, &avi, true);
-        amd_dcn3_vpg_write_packet(ops, dig_idx, AMD_DCN3_PKT_SLOT_VENDOR, &vsif, true);
-        amd_dcn3_vpg_write_packet(ops, dig_idx, AMD_DCN3_PKT_SLOT_HDRSMD, NULL, true);
+        amd_dcn_vpg_write_packet(ops, params->vpg_access_reg, AMD_DCN3_PKT_SLOT_AVI, &avi, true);
+        amd_dcn_vpg_write_packet(ops, params->vpg_access_reg, AMD_DCN3_PKT_SLOT_VENDOR, &vsif, true);
+        amd_dcn_vpg_write_packet(ops, params->vpg_access_reg, AMD_DCN3_PKT_SLOT_HDRSMD, NULL, true);
 
-        /* Set HDMI_GENERIC0_LINE = 2 (bits 15:0) and HDMI_GENERIC1_LINE = 2 (bits 31:16) */
-        ctrl1 = (2U << 0) | (2U << 16);
-        ops->write32(ops->user_ctx, ctrl1_reg, ctrl1);
+        /* Set HDMI_GENERIC0_LINE = 2 (bits 14:0/15:0) and HDMI_GENERIC1_LINE = 2 (bits 30:16/31:16) */
+        ops->write32(ops->user_ctx, params->pkt01_line_reg, (2U << 0) | (2U << 16));
 
-        /* Clear HDMI_GENERIC4_LINE (bits 15:0 of CONTROL2) */
-        ctrl2 &= ~0x0000FFFFU;
-        ops->write32(ops->user_ctx, ctrl2_reg, ctrl2);
+        /* Clear HDMI_GENERIC4_LINE (lower 16 bits of CONTROL2 / PACKET4_5_LINE) */
+        line45 &= ~0x0000FFFFU;
+        ops->write32(ops->user_ctx, params->pkt45_line_reg, line45);
 
         /* Enable GENERIC0_SEND|CONT (bits 1:0 = 0x3) + GENERIC1_SEND|CONT (bits 5:4 = 0x30),
          * and disable GENERIC4_SEND|CONT (bits 17:16 = 0) */
         ctrl0 &= ~(0x3U << 16);
         ctrl0 |= (0x3U << 0) | (0x3U << 4);
-        ops->write32(ops->user_ctx, ctrl0_reg, ctrl0);
+        ops->write32(ops->user_ctx, params->gen_ctrl0_reg, ctrl0);
     } else {
         /* Disable GENERIC1_SEND|CONT (bits 5:4) and clear VPG slot 1 */
         ctrl0 &= ~(0x3U << 4);
-        ops->write32(ops->user_ctx, ctrl0_reg, ctrl0);
-        amd_dcn3_vpg_write_packet(ops, dig_idx, AMD_DCN3_PKT_SLOT_VENDOR, NULL, true);
-        (void)ctrl1;
+        ops->write32(ops->user_ctx, params->gen_ctrl0_reg, ctrl0);
+        amd_dcn_vpg_write_packet(ops, params->vpg_access_reg, AMD_DCN3_PKT_SLOT_VENDOR, NULL, true);
     }
+}
+
+void dvbridge_win_amd_dcn3_apply_dv_ex(
+    const struct dvbridge_mmio_ops *ops,
+    unsigned dig_idx,
+    unsigned fmt_idx,
+    uint32_t gen_ctrl0_dword,
+    bool enable_dv,
+    bool legacy_vsif,
+    uint8_t cta_vic)
+{
+    if (dig_idx >= AMD_DCN_MAX_DIGS || fmt_idx >= AMD_DCN_MAX_PIPES)
+        return;
+
+    if (gen_ctrl0_dword == 0U)
+        gen_ctrl0_dword = AMD_DCN3_A_DIG0_HDMI_GEN_CTRL0;
+
+    const uint32_t stride = (gen_ctrl0_dword == AMD_DCN3_C_DIG0_HDMI_GEN_CTRL0)
+                                ? AMD_DCN3_C_DIG_DWORD_STRIDE
+                                : AMD_DCN3_DIG_DWORD_STRIDE;
+
+    struct dvbridge_amd_dcn_params params;
+    params.fmt_bit_depth_reg = AMD_REG_FMT_BIT_DEPTH_CONTROL(fmt_idx);
+    params.vpg_access_reg    = AMD_REG_DCN3_VPG_ACCESS_CTRL_S(dig_idx, stride);
+    params.gen_ctrl0_reg     = AMD_DCN3_DIG_REG_OFFSET_S(dig_idx, gen_ctrl0_dword, stride);
+    params.pkt01_line_reg    = AMD_DCN3_DIG_REG_OFFSET_S(dig_idx, gen_ctrl0_dword + 4U, stride);
+    params.pkt45_line_reg    = AMD_DCN3_DIG_REG_OFFSET_S(dig_idx, gen_ctrl0_dword + 5U, stride);
+
+    dvbridge_win_amd_dcn_apply_params(ops, &params, enable_dv, legacy_vsif, cta_vic);
 }
 
 void dvbridge_win_amd_dcn3_apply_dv(

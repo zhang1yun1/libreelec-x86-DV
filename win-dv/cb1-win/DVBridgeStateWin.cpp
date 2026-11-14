@@ -262,13 +262,15 @@ bool g_hasSavedIntelPipeMisc[4]{};
 struct SavedAmdState
 {
   bool valid{false};
-  uint32_t digIdx{0};
+  bool isHpoFrl{false};
+  uint32_t digBeIdx{0};
+  uint32_t digFeIdx{0};
   uint32_t fmtIdx{0};
-  uint32_t genCtrl0Dword{AMD_DCN3_A_DIG0_HDMI_GEN_CTRL0};
+  dvbridge_amd_dcn_params params{};
   uint32_t origFmtBitDepthCtrl{0};
   uint32_t origGenCtrl0{0};
-  uint32_t origGenCtrl1{0};
-  uint32_t origGenCtrl2{0};
+  uint32_t origPkt01Line{0};
+  uint32_t origPkt45Line{0};
 } g_savedAmdState;
 
 uint32_t g_mmioMappedSize = 0x100000U;
@@ -291,79 +293,226 @@ void MmioWrite32Mapped(void* userCtx, uint32_t regOffset, uint32_t value)
 
 struct AmdDcnLayout
 {
+  uint32_t stride;
   uint32_t feCntlDword;
-  uint32_t hdmiCtrlDword;
+  uint32_t feClkCntlDword;
+  uint32_t feEnCntlDword;
   uint32_t genCtrl0Dword;
+  uint32_t beClkCntlDword;
   uint32_t beCntlDword;
+  uint32_t beEnCntlDword;
+  bool splitClkRegs;
 };
 
 struct AmdDcnTarget
 {
-  uint32_t digIdx{0};
+  dvbridge_amd_dcn_params params{};
+  uint32_t digBeIdx{0};
+  uint32_t digFeIdx{0};
+  uint32_t otgIdx{0};
   uint32_t fmtIdx{0};
   uint32_t genCtrl0Dword{AMD_DCN3_A_DIG0_HDMI_GEN_CTRL0};
-  uint32_t feCntl{0};
-  uint32_t beCntl{0};
-  uint32_t digMode{0};
+  uint32_t digMode{0xFFU};
+  bool isHpoFrl{false};
   bool found{false};
 };
 
-AmdDcnTarget DetectAmdDcnTarget(const dvbridge_mmio_ops& ops, uint32_t deviceId)
+std::array<AmdDcnLayout, 3> GetOrderedAmdDcnLayouts(uint32_t deviceId)
 {
-  constexpr AmdDcnLayout kLayoutA{AMD_DCN3_A_DIG0_FE_CNTL, AMD_DCN3_A_DIG0_HDMI_CTRL,
-                                  AMD_DCN3_A_DIG0_HDMI_GEN_CTRL0, AMD_DCN3_A_DIG0_BE_CNTL};
-  constexpr AmdDcnLayout kLayoutB{AMD_DCN3_B_DIG0_FE_CNTL, AMD_DCN3_B_DIG0_HDMI_CTRL,
-                                  AMD_DCN3_B_DIG0_HDMI_GEN_CTRL0, AMD_DCN3_B_DIG0_BE_CNTL};
-  constexpr AmdDcnLayout kLayoutC{AMD_DCN3_C_DIG0_FE_CNTL, AMD_DCN3_C_DIG0_HDMI_CTRL,
-                                  AMD_DCN3_C_DIG0_HDMI_GEN_CTRL0, AMD_DCN3_C_DIG0_BE_CNTL};
+  constexpr AmdDcnLayout kLayoutA{AMD_DCN3_DIG_DWORD_STRIDE,
+                                  AMD_DCN3_A_DIG0_FE_CNTL,
+                                  0U,
+                                  0U,
+                                  AMD_DCN3_A_DIG0_HDMI_GEN_CTRL0,
+                                  0U,
+                                  AMD_DCN3_A_DIG0_BE_CNTL,
+                                  AMD_DCN3_A_DIG0_BE_CNTL + 1U,
+                                  false};
+  constexpr AmdDcnLayout kLayoutB{AMD_DCN3_DIG_DWORD_STRIDE,
+                                  AMD_DCN3_B_DIG0_FE_CNTL,
+                                  0U,
+                                  0U,
+                                  AMD_DCN3_B_DIG0_HDMI_GEN_CTRL0,
+                                  0U,
+                                  AMD_DCN3_B_DIG0_BE_CNTL,
+                                  AMD_DCN3_B_DIG0_BE_CNTL + 1U,
+                                  false};
+  // DCN 3.5 / 3.5.1 / 3.6 / 4.01 (Strix, RX 9000): 0x124 stride + split clock/enable regs
+  constexpr AmdDcnLayout kLayoutC{AMD_DCN3_C_DIG_DWORD_STRIDE,
+                                  AMD_DCN3_C_DIG0_FE_CNTL,
+                                  AMD_DCN3_C_DIG0_FE_CLK_CNTL,
+                                  AMD_DCN3_C_DIG0_FE_EN_CNTL,
+                                  AMD_DCN3_C_DIG0_HDMI_GEN_CTRL0,
+                                  AMD_DCN3_C_DIG0_BE_CLK_CNTL,
+                                  AMD_DCN3_C_DIG0_BE_CNTL,
+                                  AMD_DCN3_C_DIG0_BE_EN_CNTL,
+                                  true};
 
-  // Order candidate DCN register layouts by GPU Device ID, falling back to probing all three.
-  std::array<AmdDcnLayout, 3> layouts{kLayoutA, kLayoutB, kLayoutC};
   if (deviceId == 0x150EU || deviceId == 0x1586U || deviceId == 0x1114U ||
       (deviceId >= 0x7550U && deviceId <= 0x759FU))
   {
-    layouts = {kLayoutC, kLayoutB, kLayoutA};
+    return {kLayoutC, kLayoutB, kLayoutA};
   }
-  else if (deviceId == 0x15BFU || deviceId == 0x15C8U || deviceId == 0x1900U ||
-           (deviceId >= 0x7440U && deviceId <= 0x749FU))
+  if (deviceId == 0x15BFU || deviceId == 0x15C8U || deviceId == 0x1900U ||
+      (deviceId >= 0x7440U && deviceId <= 0x749FU))
   {
-    layouts = {kLayoutB, kLayoutA, kLayoutC};
+    return {kLayoutB, kLayoutA, kLayoutC};
   }
+  return {kLayoutA, kLayoutB, kLayoutC};
+}
 
+dvbridge_amd_dcn_params MakeDioDcnParams(uint32_t feIdx,
+                                         uint32_t fmtIdx,
+                                         uint32_t genCtrl0Dword,
+                                         uint32_t stride)
+{
+  dvbridge_amd_dcn_params p{};
+  p.fmt_bit_depth_reg = AMD_REG_FMT_BIT_DEPTH_CONTROL(fmtIdx);
+  p.vpg_access_reg = AMD_REG_DCN3_VPG_ACCESS_CTRL_S(feIdx, stride);
+  p.gen_ctrl0_reg = AMD_DCN3_DIG_REG_OFFSET_S(feIdx, genCtrl0Dword, stride);
+  p.pkt01_line_reg = AMD_DCN3_DIG_REG_OFFSET_S(feIdx, genCtrl0Dword + 4U, stride);
+  p.pkt45_line_reg = AMD_DCN3_DIG_REG_OFFSET_S(feIdx, genCtrl0Dword + 5U, stride);
+  return p;
+}
+
+uint32_t ResolveAmdFmtFromOtg(const dvbridge_mmio_ops& ops, uint32_t otgIdx)
+{
+  if (otgIdx >= AMD_DCN_MAX_PIPES)
+    return 0U;
+  const uint32_t opSel = ops.read32(ops.user_ctx, AMD_REG_ODM_OPTC_DATA_SOURCE(otgIdx));
+  if (opSel != 0xFFFFFFFFU)
+  {
+    const uint32_t seg0 = (opSel & AMD_OPTC_SEG0_SRC_SEL_MASK) >> AMD_OPTC_SEG0_SRC_SEL_SHIFT;
+    if (seg0 < AMD_DCN_MAX_PIPES)
+      return seg0;
+  }
+  return otgIdx;
+}
+
+bool IsAmdOtgEnabled(const dvbridge_mmio_ops& ops, uint32_t otgIdx, bool splitClkRegs)
+{
+  if (otgIdx >= AMD_DCN_MAX_PIPES)
+    return false;
+  const uint32_t otgReg =
+      splitClkRegs ? AMD_REG_OTG_CONTROL_C(otgIdx) : AMD_REG_OTG_CONTROL_A(otgIdx);
+  const uint32_t otgCtrl = ops.read32(ops.user_ctx, otgReg);
+  return otgCtrl != 0xFFFFFFFFU && (otgCtrl & AMD_OTG_MASTER_EN_MASK) != 0U;
+}
+
+AmdDcnTarget DetectAmdDcnTarget(const dvbridge_mmio_ops& ops, uint32_t deviceId)
+{
+  const auto layouts = GetOrderedAmdDcnLayouts(deviceId);
   AmdDcnTarget fallbackExt;
+  std::array<bool, AMD_DCN_MAX_PIPES> dioActiveOtg{};
+
   for (const auto& layout : layouts)
   {
-    for (uint32_t dig = 0; dig < AMD_DCN_MAX_DIGS; ++dig)
+    for (uint32_t be = 0; be < AMD_DCN_MAX_DIGS; ++be)
     {
-      const uint32_t feCntl =
-          ops.read32(ops.user_ctx, AMD_DCN3_DIG_REG_OFFSET(dig, layout.feCntlDword));
-      const uint32_t beCntl =
-          ops.read32(ops.user_ctx, AMD_DCN3_DIG_REG_OFFSET(dig, layout.beCntlDword));
-      const uint32_t genCtrl0 =
-          ops.read32(ops.user_ctx, AMD_DCN3_DIG_REG_OFFSET(dig, layout.genCtrl0Dword));
-      if (feCntl == 0xFFFFFFFFU || beCntl == 0xFFFFFFFFU || genCtrl0 == 0xFFFFFFFFU)
+      const uint32_t beCntl = ops.read32(
+          ops.user_ctx, AMD_DCN3_DIG_REG_OFFSET_S(be, layout.beCntlDword, layout.stride));
+      const uint32_t beEnCntl = ops.read32(
+          ops.user_ctx, AMD_DCN3_DIG_REG_OFFSET_S(be, layout.beEnCntlDword, layout.stride));
+      if (beCntl == 0xFFFFFFFFU || beEnCntl == 0xFFFFFFFFU)
         continue;
-      if ((genCtrl0 & 0x88880000U) == 0U)
+      if ((beEnCntl & 1U) == 0U)
         continue;
 
-      const bool symclkOn = ((feCntl >> 24) & 1U) != 0U;
-      const uint32_t digMode = (beCntl >> 16) & 0x7U;
-      if (!symclkOn)
+      uint32_t digMode = 0xFFU;
+      if (layout.splitClkRegs)
+      {
+        const uint32_t beClkCntl = ops.read32(
+            ops.user_ctx, AMD_DCN3_DIG_REG_OFFSET_S(be, layout.beClkCntlDword, layout.stride));
+        if (beClkCntl == 0xFFFFFFFFU || (beClkCntl & 0x10U) == 0U)
+          continue;
+        digMode = beClkCntl & 0x7U;
+      }
+      else
+      {
+        digMode = (beCntl >> 16) & 0x7U;
+      }
+
+      // DIG_BE_CNTL.DIG_FE_SOURCE_SELECT (bits 14:8) is a one-hot mask of the bound DIG_FE/VPG.
+      const uint32_t feMask = (beCntl >> 8) & 0x7FU;
+      if (feMask == 0U)
         continue;
 
-      const uint32_t rawFmt = feCntl & 0x7U;
-      const uint32_t fmtIdx = (rawFmt < AMD_DCN_MAX_PIPES) ? rawFmt : 0U;
+      uint32_t fe = 0U;
+      while (fe < AMD_DCN_MAX_DIGS && (feMask & (1U << fe)) == 0U)
+        ++fe;
+      if (fe >= AMD_DCN_MAX_DIGS)
+        continue;
+
+      const uint32_t feCntl = ops.read32(
+          ops.user_ctx, AMD_DCN3_DIG_REG_OFFSET_S(fe, layout.feCntlDword, layout.stride));
+      if (feCntl == 0xFFFFFFFFU)
+        continue;
+
+      if (layout.splitClkRegs)
+      {
+        const uint32_t feClkCntl = ops.read32(
+            ops.user_ctx, AMD_DCN3_DIG_REG_OFFSET_S(fe, layout.feClkCntlDword, layout.stride));
+        const uint32_t feEnCntl = ops.read32(
+            ops.user_ctx, AMD_DCN3_DIG_REG_OFFSET_S(fe, layout.feEnCntlDword, layout.stride));
+        if (feClkCntl == 0xFFFFFFFFU || feEnCntl == 0xFFFFFFFFU ||
+            (feEnCntl & 1U) == 0U || (feClkCntl & 0x10U) == 0U)
+        {
+          continue;
+        }
+      }
+      else
+      {
+        const bool symclkOn = ((feCntl >> 24) & 1U) != 0U;
+        if (!symclkOn)
+          continue;
+      }
+
+      const uint32_t otgIdx = feCntl & 0x7U;
+      if (otgIdx >= AMD_DCN_MAX_PIPES || !IsAmdOtgEnabled(ops, otgIdx, layout.splitClkRegs))
+        continue;
+
+      dioActiveOtg[otgIdx] = true;
+      const uint32_t fmtIdx = ResolveAmdFmtFromOtg(ops, otgIdx);
+      const dvbridge_amd_dcn_params params =
+          MakeDioDcnParams(fe, fmtIdx, layout.genCtrl0Dword, layout.stride);
 
       if (digMode == 3U) // DIG_MODE = 3: TMDS_HDMI
       {
-        return AmdDcnTarget{dig, fmtIdx, layout.genCtrl0Dword, feCntl, beCntl, digMode, true};
+        return AmdDcnTarget{params, be, fe, otgIdx, fmtIdx, layout.genCtrl0Dword, digMode, false, true};
       }
       if (!fallbackExt.found && digMode != 1U) // Non-LVDS external output fallback (e.g. DP-to-HDMI)
       {
-        fallbackExt = AmdDcnTarget{dig, fmtIdx, layout.genCtrl0Dword, feCntl, beCntl, digMode, true};
+        fallbackExt =
+            AmdDcnTarget{params, be, fe, otgIdx, fmtIdx, layout.genCtrl0Dword, digMode, false, true};
       }
     }
   }
+
+  // Probe HDMI 2.1 FRL (HPO Stream Encoder + dedicated SEG3 VPG) before falling back to DP.
+  const uint32_t hpoClk = ops.read32(ops.user_ctx, AMD_REG_DCN_HPO_STREAM_CLK_CTRL);
+  const uint32_t hpoTbCtrl = ops.read32(ops.user_ctx, AMD_REG_DCN_HPO_TB_ENC_CTRL);
+  const uint32_t hpoMux = ops.read32(ops.user_ctx, AMD_REG_DCN_HPO_STREAM_MUX_CTRL);
+  const uint32_t hpoGen0 = ops.read32(ops.user_ctx, AMD_REG_DCN_HPO_TB_GEN_CTRL0);
+  const uint32_t hpoVpg = ops.read32(ops.user_ctx, AMD_REG_DCN_HPO_VPG_ACCESS_CTRL);
+  if (hpoClk != 0xFFFFFFFFU && hpoTbCtrl != 0xFFFFFFFFU && hpoMux != 0xFFFFFFFFU &&
+      hpoGen0 != 0xFFFFFFFFU && hpoVpg != 0xFFFFFFFFU &&
+      (hpoClk & 1U) != 0U && (hpoTbCtrl & 1U) != 0U)
+  {
+    const uint32_t otgIdx = hpoMux & 0x7U;
+    if (otgIdx < AMD_DCN_MAX_PIPES && !dioActiveOtg[otgIdx] &&
+        IsAmdOtgEnabled(ops, otgIdx, layouts[0].splitClkRegs))
+    {
+      const uint32_t fmtIdx = ResolveAmdFmtFromOtg(ops, otgIdx);
+      dvbridge_amd_dcn_params hpoParams{};
+      hpoParams.fmt_bit_depth_reg = AMD_REG_FMT_BIT_DEPTH_CONTROL(fmtIdx);
+      hpoParams.vpg_access_reg = AMD_REG_DCN_HPO_VPG_ACCESS_CTRL;
+      hpoParams.gen_ctrl0_reg = AMD_REG_DCN_HPO_TB_GEN_CTRL0;
+      hpoParams.pkt01_line_reg = AMD_REG_DCN_HPO_TB_PKT0_1_LINE;
+      hpoParams.pkt45_line_reg = AMD_REG_DCN_HPO_TB_PKT4_5_LINE;
+      return AmdDcnTarget{hpoParams, 0U, 0U, otgIdx, fmtIdx, 0x08E6U, 6U, true, true};
+    }
+  }
+
   return fallbackExt;
 }
 
@@ -1430,94 +1579,122 @@ bool CDVBridgeStateWin::Stage(bool restore)
   {
     if (!restore)
     {
-      uint32_t digIdx = (m_pipeOrInst < AMD_DCN_MAX_DIGS) ? m_pipeOrInst : 0U;
-      uint32_t fmtIdx = (m_pipeOrInst < AMD_DCN_MAX_PIPES) ? m_pipeOrInst : 0U;
-      uint32_t genCtrl0Dword = AMD_DCN3_A_DIG0_HDMI_GEN_CTRL0;
-
+      dvbridge_amd_dcn_params params{};
       if (g_savedAmdState.valid)
       {
-        digIdx = g_savedAmdState.digIdx;
-        fmtIdx = g_savedAmdState.fmtIdx;
-        genCtrl0Dword = g_savedAmdState.genCtrl0Dword;
+        params = g_savedAmdState.params;
       }
       else
       {
         const AmdDcnTarget target = DetectAmdDcnTarget(m_mmioOps, m_gpu.deviceId);
+        uint32_t digBeIdx = 0U;
+        uint32_t digFeIdx = 0U;
+        uint32_t fmtIdx = 0U;
+        uint32_t otgIdx = 0U;
+        uint32_t genCtrl0Dword = 0U;
+        bool isHpoFrl = false;
+
         if (target.found)
         {
-          digIdx = target.digIdx;
+          params = target.params;
+          digBeIdx = target.digBeIdx;
+          digFeIdx = target.digFeIdx;
           fmtIdx = target.fmtIdx;
+          otgIdx = target.otgIdx;
           genCtrl0Dword = target.genCtrl0Dword;
+          isHpoFrl = target.isHpoFrl;
         }
         else
         {
+          const auto layouts = GetOrderedAmdDcnLayouts(m_gpu.deviceId);
+          digBeIdx = (m_pipeOrInst < AMD_DCN_MAX_DIGS) ? m_pipeOrInst : 0U;
+          digFeIdx = digBeIdx;
+          fmtIdx = (m_pipeOrInst < AMD_DCN_MAX_PIPES) ? m_pipeOrInst : 0U;
+          genCtrl0Dword = layouts[0].genCtrl0Dword;
+          params = MakeDioDcnParams(digFeIdx, fmtIdx, genCtrl0Dword, layouts[0].stride);
           CLog::Log(LOGWARNING,
-                    "[DVBridge-Win] AMD DCN active DIG not matched (DEV_0x{:04X}); falling back to DIG{}/FMT{}.",
-                    m_gpu.deviceId, digIdx, fmtIdx);
+                    "[DVBridge-Win] AMD DCN active DIG/HPO not matched (DEV_0x{:04X}); falling back to DIG{}/FMT{} (GEN_CTRL0_DW=0x{:04X}).",
+                    m_gpu.deviceId, digFeIdx, fmtIdx, genCtrl0Dword);
         }
 
-        const uint32_t fmtReg = AMD_REG_FMT_BIT_DEPTH_CONTROL(fmtIdx);
-        const uint32_t ctrl0Reg = AMD_DCN3_DIG_REG_OFFSET(digIdx, genCtrl0Dword);
-        const uint32_t ctrl1Reg = AMD_DCN3_DIG_REG_OFFSET(digIdx, genCtrl0Dword + 4U);
-        const uint32_t ctrl2Reg = AMD_DCN3_DIG_REG_OFFSET(digIdx, genCtrl0Dword + 5U);
-
-        g_savedAmdState.digIdx = digIdx;
+        g_savedAmdState.isHpoFrl = isHpoFrl;
+        g_savedAmdState.digBeIdx = digBeIdx;
+        g_savedAmdState.digFeIdx = digFeIdx;
         g_savedAmdState.fmtIdx = fmtIdx;
-        g_savedAmdState.genCtrl0Dword = genCtrl0Dword;
-        g_savedAmdState.origFmtBitDepthCtrl = m_mmioOps.read32(m_mmioOps.user_ctx, fmtReg);
-        g_savedAmdState.origGenCtrl0 = m_mmioOps.read32(m_mmioOps.user_ctx, ctrl0Reg);
-        g_savedAmdState.origGenCtrl1 = m_mmioOps.read32(m_mmioOps.user_ctx, ctrl1Reg);
-        g_savedAmdState.origGenCtrl2 = m_mmioOps.read32(m_mmioOps.user_ctx, ctrl2Reg);
+        g_savedAmdState.params = params;
+        g_savedAmdState.origFmtBitDepthCtrl =
+            m_mmioOps.read32(m_mmioOps.user_ctx, params.fmt_bit_depth_reg);
+        g_savedAmdState.origGenCtrl0 = m_mmioOps.read32(m_mmioOps.user_ctx, params.gen_ctrl0_reg);
+        g_savedAmdState.origPkt01Line =
+            m_mmioOps.read32(m_mmioOps.user_ctx, params.pkt01_line_reg);
+        g_savedAmdState.origPkt45Line =
+            m_mmioOps.read32(m_mmioOps.user_ctx, params.pkt45_line_reg);
         g_savedAmdState.valid = true;
 
-        CLog::Log(LOGINFO,
-                  "[DVBridge-Win] AMD DCN active output: DIG{} (MODE={}) <- FMT{}, GEN_CTRL0_DW=0x{:04X}, "
-                  "FMT_BIT_DEPTH=0x{:08X}, GEN_CTRL0=0x{:08X}, reqVIC={} -> enabling TV-Led Dolby Vision VSIF",
-                  digIdx, target.found ? target.digMode : 0xFFU, fmtIdx, genCtrl0Dword,
-                  g_savedAmdState.origFmtBitDepthCtrl, g_savedAmdState.origGenCtrl0, int(m_ctaVic));
+        if (isHpoFrl)
+        {
+          CLog::Log(LOGINFO,
+                    "[DVBridge-Win] AMD DCN active output: HPO_FRL (OTG{}, SEG3 VPG/TB_ENC) <- FMT{}, "
+                    "FMT_BIT_DEPTH=0x{:08X}, GEN_CTRL0=0x{:08X}, reqVIC={} -> enabling TV-Led Dolby Vision VSIF",
+                    otgIdx, fmtIdx, g_savedAmdState.origFmtBitDepthCtrl, g_savedAmdState.origGenCtrl0,
+                    int(m_ctaVic));
+        }
+        else
+        {
+          CLog::Log(LOGINFO,
+                    "[DVBridge-Win] AMD DCN active output: DIG_BE{}/FE{} (MODE={}, OTG{}) <- FMT{}, "
+                    "GEN_CTRL0_DW=0x{:04X}, FMT_BIT_DEPTH=0x{:08X}, GEN_CTRL0=0x{:08X}, reqVIC={} -> enabling TV-Led Dolby Vision VSIF",
+                    digBeIdx, digFeIdx, target.found ? target.digMode : 0xFFU, otgIdx, fmtIdx,
+                    genCtrl0Dword, g_savedAmdState.origFmtBitDepthCtrl,
+                    g_savedAmdState.origGenCtrl0, int(m_ctaVic));
+        }
       }
 
-      const uint32_t fmtReg = AMD_REG_FMT_BIT_DEPTH_CONTROL(fmtIdx);
-      const uint32_t ctrl0Reg = AMD_DCN3_DIG_REG_OFFSET(digIdx, genCtrl0Dword);
-      const uint32_t curFmt = m_mmioOps.read32(m_mmioOps.user_ctx, fmtReg);
-      const uint32_t curGen0 = m_mmioOps.read32(m_mmioOps.user_ctx, ctrl0Reg);
+      const uint32_t curFmt = m_mmioOps.read32(m_mmioOps.user_ctx, params.fmt_bit_depth_reg);
+      const uint32_t curGen0 = m_mmioOps.read32(m_mmioOps.user_ctx, params.gen_ctrl0_reg);
       if ((curFmt & AMD_FMT_ALL_DITHER_TRUNC_MASK) !=
               (AMD_FMT_TRUNCATE_EN_MASK | AMD_FMT_TRUNCATE_DEPTH_8BPC) ||
-          (curGen0 & 0x33U) != 0x33U)
+          (curGen0 & 0x00030033U) != 0x00000033U)
       {
-        dvbridge_win_amd_dcn3_apply_dv_ex(&m_mmioOps, digIdx, fmtIdx, genCtrl0Dword, true,
-                                          m_legacyVsif, m_ctaVic);
+        dvbridge_win_amd_dcn_apply_params(&m_mmioOps, &params, true, m_legacyVsif, m_ctaVic);
       }
     }
     else
     {
       if (g_savedAmdState.valid)
       {
-        const uint32_t digIdx = g_savedAmdState.digIdx;
-        const uint32_t fmtIdx = g_savedAmdState.fmtIdx;
-        const uint32_t genCtrl0Dword = g_savedAmdState.genCtrl0Dword;
+        const dvbridge_amd_dcn_params& params = g_savedAmdState.params;
 
-        dvbridge_win_amd_dcn3_apply_dv_ex(&m_mmioOps, digIdx, fmtIdx, genCtrl0Dword, false,
-                                          m_legacyVsif, m_ctaVic);
+        dvbridge_win_amd_dcn_apply_params(&m_mmioOps, &params, false, m_legacyVsif, m_ctaVic);
 
-        const uint32_t fmtReg = AMD_REG_FMT_BIT_DEPTH_CONTROL(fmtIdx);
-        const uint32_t ctrl0Reg = AMD_DCN3_DIG_REG_OFFSET(digIdx, genCtrl0Dword);
-        const uint32_t ctrl1Reg = AMD_DCN3_DIG_REG_OFFSET(digIdx, genCtrl0Dword + 4U);
-        const uint32_t ctrl2Reg = AMD_DCN3_DIG_REG_OFFSET(digIdx, genCtrl0Dword + 5U);
-
-        m_mmioOps.write32(m_mmioOps.user_ctx, ctrl1Reg, g_savedAmdState.origGenCtrl1);
-        m_mmioOps.write32(m_mmioOps.user_ctx, ctrl2Reg, g_savedAmdState.origGenCtrl2);
-        m_mmioOps.write32(m_mmioOps.user_ctx, ctrl0Reg, g_savedAmdState.origGenCtrl0);
-        m_mmioOps.write32(m_mmioOps.user_ctx, fmtReg, g_savedAmdState.origFmtBitDepthCtrl);
+        m_mmioOps.write32(m_mmioOps.user_ctx, params.pkt01_line_reg, g_savedAmdState.origPkt01Line);
+        m_mmioOps.write32(m_mmioOps.user_ctx, params.pkt45_line_reg, g_savedAmdState.origPkt45Line);
+        m_mmioOps.write32(m_mmioOps.user_ctx, params.gen_ctrl0_reg, g_savedAmdState.origGenCtrl0);
+        m_mmioOps.write32(m_mmioOps.user_ctx, params.fmt_bit_depth_reg,
+                          g_savedAmdState.origFmtBitDepthCtrl);
         g_savedAmdState.valid = false;
 
         CLog::Log(LOGINFO,
-                  "[DVBridge-Win] AMD DCN DIG{}/FMT{} restored original GEN_CTRL0..2 & FMT_BIT_DEPTH_CONTROL",
-                  digIdx, fmtIdx);
+                  "[DVBridge-Win] AMD DCN {}/FMT{} restored original GEN_CTRL0 & FMT_BIT_DEPTH_CONTROL",
+                  g_savedAmdState.isHpoFrl ? std::string("HPO_FRL")
+                                           : ("DIG_FE" + std::to_string(g_savedAmdState.digFeIdx)),
+                  g_savedAmdState.fmtIdx);
       }
       else
       {
-        dvbridge_win_amd_dcn3_apply_dv(&m_mmioOps, m_pipeOrInst, false, m_legacyVsif, m_ctaVic);
+        const AmdDcnTarget target = DetectAmdDcnTarget(m_mmioOps, m_gpu.deviceId);
+        if (target.found)
+        {
+          dvbridge_win_amd_dcn_apply_params(&m_mmioOps, &target.params, false, m_legacyVsif,
+                                            m_ctaVic);
+        }
+        else
+        {
+          const auto layouts = GetOrderedAmdDcnLayouts(m_gpu.deviceId);
+          dvbridge_win_amd_dcn3_apply_dv_ex(&m_mmioOps, m_pipeOrInst, m_pipeOrInst,
+                                            layouts[0].genCtrl0Dword, false, m_legacyVsif,
+                                            m_ctaVic);
+        }
       }
     }
     return true;
@@ -1527,8 +1704,3 @@ bool CDVBridgeStateWin::Stage(bool restore)
 }
 
 } // namespace KODI::WINDOWING::WINDOWS
-
-extern "C" {
-#include "dvbridge_win_mmio.c"
-#include "dvbridge_fel.c"
-}
