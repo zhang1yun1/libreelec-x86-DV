@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Windows CMake Build Configuration for CB1 / DVBridge (CMakeLists.windows.txt)
+# Builds:
+#   1. dvbridge_core (Pure C11 / GLSL 300 es Dolby Vision & HDR10 Reference Engine + Windows shims)
+#   2. dvbridge_win_mmio (Intel Gen9-14 & AMD DCN 1.0-4.01 HDMI VSIF/AVI + 8bpc No-Dither MMIO Bridge)
+#   3. windowing_win10_dvbridge (Windows DXGI SwapChain + SetupAPI EDID + MMIO Transport State)
+
+cmake_minimum_required(VERSION 3.20)
+project(dvbridge_windows LANGUAGES C CXX)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 20)
+
+option(CB1_ENABLE_HDR10_AI "Enable CB1 LightGBM L1/L3 Dynamic HDR10 AI Predictor" OFF)
+
+set(CB1_ORIG_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../le-repo/packages/mediacenter/kodi/cb1/src"
+    CACHE PATH "Path to upstream CB1 C11/GLSL source directory")
+
+set(DVBRIDGE_CORE_WIN_SOURCES
+    # Platform-independent CB1 C11 / GLSL 300 es core modules
+    ${CB1_ORIG_SRC_DIR}/dvbridge_core.c
+    ${CB1_ORIG_SRC_DIR}/dvbridge_render.c
+    ${CB1_ORIG_SRC_DIR}/dvbridge_placebo.c
+    ${CB1_ORIG_SRC_DIR}/dvbridge_cache.c
+    ${CB1_ORIG_SRC_DIR}/cb1_hdr10plus.c
+    # Windows-specific replacements for Linux VAAPI / DRM-Prime dmabuf / POSIX
+    ${CMAKE_CURRENT_SOURCE_DIR}/dvbridge_dmabuf_win.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/dvbridge_fel_win.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/dvbridge_fel_vpp_win.c
+    # Windows HDMI VSIF / AVI InfoFrame & Intel/AMD MMIO engine + Golden Frame packer
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dvbridge_win_mmio.c
+)
+
+if(CB1_ENABLE_HDR10_AI)
+  list(APPEND DVBRIDGE_CORE_WIN_SOURCES
+      ${CB1_ORIG_SRC_DIR}/cb1_hdr10_ai.c
+      ${CB1_ORIG_SRC_DIR}/cb1_l1l3_model.c
+  )
+endif()
+
+add_library(dvbridge_core STATIC ${DVBRIDGE_CORE_WIN_SOURCES})
+
+target_include_directories(dvbridge_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${CB1_ORIG_SRC_DIR}
+)
+
+if(WIN32)
+  target_compile_definitions(dvbridge_core PUBLIC
+      _CRT_SECURE_NO_WARNINGS
+      WIN32_LEAN_AND_MEAN
+      NOMINMAX
+      HAVE_DVBRIDGE=1
+  )
+  # Force-include cb1_win_compat.h on Windows so POSIX calls in dvbridge_cache.c resolve cleanly
+  if(MSVC)
+    target_compile_options(dvbridge_core PRIVATE /FI"${CMAKE_CURRENT_SOURCE_DIR}/cb1_win_compat.h")
+  else()
+    target_compile_options(dvbridge_core PRIVATE -include "${CMAKE_CURRENT_SOURCE_DIR}/cb1_win_compat.h")
+  endif()
+endif()
+
+add_library(windowing_win10_dvbridge STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/DVBridgeStateWin.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/DVBridgeStateWin.h
+)
+
+target_link_libraries(windowing_win10_dvbridge PUBLIC dvbridge_core)
+if(WIN32)
+  target_link_libraries(windowing_win10_dvbridge PUBLIC setupapi dxgi advapi32)
+endif()
