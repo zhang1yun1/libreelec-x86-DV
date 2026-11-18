@@ -1,0 +1,295 @@
+name: Sync Upstream & Publish Docker Hub Images
+
+on:
+  schedule:
+    - cron: '25 */2 * * *' # 每 2 小时自动检查一次上游更新与 Release
+  workflow_dispatch:
+    inputs:
+      force_userland:
+        description: '强制重新构建并推送用户态镜像 (latest)'
+        required: false
+        default: false
+        type: boolean
+      force_kernel:
+        description: '强制重新编译并推送定制内核镜像 (kernel)'
+        required: false
+        default: false
+        type: boolean
+      repack_kernel:
+        description: '仅更新内核安装器脚本并重新打包推送 :kernel (无需重编内核)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME || 'aguan' }}/libreelec-kodi-dv
+  BASELINE_KERNEL_HASH: "c8bebb1af5e7e0c887588cf3293d3e531d114aef02fed14332651ee7480c8f2b"
+
+jobs:
+  check-and-sync:
+    runs-on: ubuntu-latest
+    outputs:
+      need_userland: ${{ steps.detect.outputs.need_userland }}
+      release_tag: ${{ steps.detect.outputs.release_tag }}
+      asset_url: ${{ steps.detect.outputs.asset_url }}
+      need_kernel: ${{ steps.detect.outputs.need_kernel }}
+      need_repack_kernel: ${{ steps.detect.outputs.need_repack_kernel }}
+      kernel_hash: ${{ steps.detect.outputs.kernel_hash }}
+      remote_kernel_ver: ${{ steps.detect.outputs.remote_kernel_ver }}
+    steps:
+      - name: Checkout Fork Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync Fork with Upstream (Rebase-Safe Overlay)
+        run: |
+          # 备份当前分支的 .github/workflows（避免 GITHUB_TOKEN 因缺少 workflows 权限被拒）、docker-dv 与 win-dv 脚本
+          mkdir -p /tmp/custom-overlay/.github/workflows /tmp/custom-overlay/docker-dv /tmp/custom-overlay/win-dv
+          cp -rf .github/workflows/* /tmp/custom-overlay/.github/workflows/
+          cp -rf docker-dv/* /tmp/custom-overlay/docker-dv/
+          cp -rf win-dv/* /tmp/custom-overlay/win-dv/
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/CroqueMr/libreelec-x86-DV.git || true
+          git fetch upstream main
+
+          # 对齐到上游最新 main 并叠加自动化脚本
+          git checkout -B main upstream/main
+          rm -rf .github/workflows
+          mkdir -p .github/workflows docker-dv win-dv
+          cp -rf /tmp/custom-overlay/.github/workflows/* .github/workflows/
+          cp -rf /tmp/custom-overlay/docker-dv/* docker-dv/
+          cp -rf /tmp/custom-overlay/win-dv/* win-dv/
+          chmod +x docker-dv/*.sh docker-dv/*.py win-dv/*.py
+
+          git add -A .github/workflows docker-dv win-dv
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(ci): overlay Docker Hub auto-build workflow onto upstream/main"
+          fi
+          git push --force origin main || echo "::warning::Fork branch push skipped; continuing build from upstream/main"
+
+      - name: Detect Upstream Release & Kernel Patch Changes
+        id: detect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y skopeo jq
+
+          # 1. 查询上游最新有效 Release (包含 LibreELEC-Generic.x86_64-*.tar 或 .img.gz)
+          RELEASE_JSON=$(gh api repos/CroqueMr/libreelec-x86-DV/releases)
+          RELEASE_TAG=$(echo "$RELEASE_JSON" | jq -r '
+            map(select(.draft == false and (.tag_name | startswith("untagged-") | not)))
+            | map(select(any(.assets[]; (.name | test("^LibreELEC-Generic\\.x86_64-.*\\.(tar|img\\.gz)$")))))
+            | .[0].tag_name // empty
+          ')
+          ASSET_URL=$(echo "$RELEASE_JSON" | jq -r --arg TAG "$RELEASE_TAG" '
+            .[] | select(.tag_name == $TAG)
+            | (.assets | map(select(.name | endswith(".tar"))) + map(select(.name | endswith(".img.gz"))))[0].browser_download_url // empty
+          ')
+
+          echo "Upstream Latest Release Tag: ${RELEASE_TAG}"
+          echo "Upstream Asset URL: ${ASSET_URL}"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "asset_url=${ASSET_URL}" >> "$GITHUB_OUTPUT"
+
+          # 读取 Docker Hub 当前 latest 镜像记录的版本标签
+          CURRENT_USERLAND_VER=$(skopeo inspect "docker://docker.io/${DOCKERHUB_REPO}:latest" 2>/dev/null | jq -r '.Labels["org.opencontainers.image.version"] // empty' || true)
+          echo "Current Docker Hub Userland Version: ${CURRENT_USERLAND_VER:-<none>}"
+
+          if [[ "${{ inputs.force_userland }}" == "true" ]] || [[ -n "$RELEASE_TAG" && "$RELEASE_TAG" != "$CURRENT_USERLAND_VER" ]]; then
+            echo ">>> 检测到用户态新版本或手动强制触发，准备构建推送用户态镜像"
+            echo "need_userland=true" >> "$GITHUB_OUTPUT"
+          else
+            echo ">>> 用户态镜像已是最新版本 (${CURRENT_USERLAND_VER})，跳过构建"
+            echo "need_userland=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # 2. 计算当前上游内核补丁树指纹
+          KERNEL_HASH=$(find packages/linux/package.mk packages/linux/patches/default projects/Generic/patches/linux projects/Generic/linux -type f | sort | xargs sha256sum | sha256sum | awk '{print $1}')
+          echo "Current Upstream Kernel Patch Hash: ${KERNEL_HASH}"
+          echo "kernel_hash=${KERNEL_HASH}" >> "$GITHUB_OUTPUT"
+
+          REMOTE_KERNEL_INFO=$(skopeo inspect "docker://docker.io/${DOCKERHUB_REPO}:kernel" 2>/dev/null || echo "{}")
+          REMOTE_KERNEL_HASH=$(echo "$REMOTE_KERNEL_INFO" | jq -r '.Labels["io.kodi-dv.kernel-hash"] // empty')
+          REMOTE_KERNEL_VER=$(echo "$REMOTE_KERNEL_INFO" | jq -r '.Labels["org.opencontainers.image.version"] // empty')
+          REMOTE_INSTALLER_REV=$(echo "$REMOTE_KERNEL_INFO" | jq -r '.Labels["io.kodi-dv.installer-rev"] // empty')
+          LOCAL_INSTALLER_REV=$(sha256sum docker-dv/build-kernel-installer.py | cut -c1-16)
+          echo "Docker Hub Kernel Version: ${REMOTE_KERNEL_VER:-<none>}, Hash: ${REMOTE_KERNEL_HASH:-<none>}, InstallerRev: ${REMOTE_INSTALLER_REV:-<none>} (Local: ${LOCAL_INSTALLER_REV})"
+          echo "remote_kernel_ver=${REMOTE_KERNEL_VER:-7.2.6-5}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${{ inputs.force_kernel }}" == "true" ]]; then
+            echo ">>> 手动强制触发内核重编"
+            echo "need_kernel=true" >> "$GITHUB_OUTPUT"
+            echo "need_repack_kernel=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$KERNEL_HASH" == "$REMOTE_KERNEL_HASH" ]] || [[ -z "$REMOTE_KERNEL_HASH" && "$REMOTE_KERNEL_VER" == "7.2.6-5" && "$KERNEL_HASH" == "$BASELINE_KERNEL_HASH" ]]; then
+            echo ">>> 上游内核补丁未发生变动，跳过内核编译"
+            echo "need_kernel=false" >> "$GITHUB_OUTPUT"
+            if [[ "${{ inputs.repack_kernel }}" == "true" ]] || [[ "$LOCAL_INSTALLER_REV" != "$REMOTE_INSTALLER_REV" ]]; then
+              echo ">>> 检测到内核安装器管理脚本更新，准备快速重新打包推送 :kernel 镜像"
+              echo "need_repack_kernel=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "need_repack_kernel=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo ">>> 检测到上游内核版本或补丁更新，准备编译新内核"
+            echo "need_kernel=true" >> "$GITHUB_OUTPUT"
+            echo "need_repack_kernel=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update Docker Hub Overview (README)
+        run: |
+          JWT_TOKEN=$(curl -s -X POST "https://hub.docker.com/v2/users/login/" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg u "${{ secrets.DOCKERHUB_USERNAME }}" --arg p "${{ secrets.DOCKERHUB_TOKEN }}" '{username: $u, password: $p}')" \
+            | jq -r '.token // empty')
+          if [[ -n "$JWT_TOKEN" ]]; then
+            PAYLOAD=$(jq -n \
+              --arg desc "LibreELEC 13 (Kodi 22 + CB1) Dolby Vision container & one-click host kernel installer/rollback tool" \
+              --rawfile full ./docker-dv/DOCKERHUB_README.md \
+              '{description: $desc, full_description: $full}')
+            HTTP_CODE=$(curl -s -o /tmp/dh-resp.json -w "%{http_code}" -X PATCH \
+              "https://hub.docker.com/v2/repositories/${DOCKERHUB_REPO}/" \
+              -H "Authorization: JWT ${JWT_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD")
+            if [[ "$HTTP_CODE" == "200" ]]; then
+              echo ">>> Docker Hub Overview 已成功自动同步更新！"
+            else
+              echo ">>> [提示] Docker Hub Overview 自动更新返回 HTTP ${HTTP_CODE}（如需自动更新 Overview，请将 Docker Hub Token 权限设为 Read, Write, Delete）"
+            fi
+          fi
+
+  repack-kernel:
+    needs: check-and-sync
+    if: needs.check-and-sync.outputs.need_repack_kernel == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Packaging Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y busybox-static skopeo
+
+      - name: Login to Docker Hub (skopeo)
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | skopeo login docker.io -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Extract Existing Kernel .deb & Repack with Updated Installer Script
+        run: |
+          mkdir -p /tmp/kernel-debs
+          docker run --rm -v /tmp/kernel-debs:/out "docker.io/${{ env.DOCKERHUB_REPO }}:kernel" --extract
+          ls -lh /tmp/kernel-debs/
+
+          KVER=$(ls /tmp/kernel-debs/linux-image-*-dv_*.deb | head -n 1 | sed -n 's|.*/linux-image-\([0-9.]*\)-dv_.*|\1|p')
+          if [[ -z "$KVER" ]]; then
+            KVER="7.2.6"
+          fi
+
+          python3 docker-dv/build-kernel-installer.py \
+            --bundle-dir /tmp/kernel-debs \
+            --output-tar /tmp/libreelec-kodi-dv-kernel.tar \
+            --kernel-ver "${KVER}-dv" \
+            --pkg-ver "${{ needs.check-and-sync.outputs.remote_kernel_ver }}" \
+            --kernel-hash "${{ needs.check-and-sync.outputs.kernel_hash }}" \
+            --repo "${{ env.DOCKERHUB_REPO }}"
+
+          skopeo copy --retry-times 5 "docker-archive:/tmp/libreelec-kodi-dv-kernel.tar" "docker://docker.io/${{ env.DOCKERHUB_REPO }}:kernel"
+          skopeo copy --retry-times 5 "docker://docker.io/${{ env.DOCKERHUB_REPO }}:kernel" "docker://docker.io/${{ env.DOCKERHUB_REPO }}:kernel-${KVER}-dv"
+
+  publish-userland:
+    needs: check-and-sync
+    if: needs.check-and-sync.outputs.need_userland == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install SquashFS & Extraction Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y squashfs-tools p7zip-full curl
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push Userland Image
+        run: |
+          chmod +x docker-dv/build-userland-image.sh
+          ./docker-dv/build-userland-image.sh \
+            "${{ needs.check-and-sync.outputs.release_tag }}" \
+            "${{ needs.check-and-sync.outputs.asset_url }}" \
+            "${{ env.DOCKERHUB_REPO }}"
+
+  publish-kernel:
+    needs: check-and-sync
+    if: needs.check-and-sync.outputs.need_kernel == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Maximize Runner Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Sync Latest Upstream Kernel Patches
+        run: |
+          git remote add upstream https://github.com/CroqueMr/libreelec-x86-DV.git || true
+          git fetch upstream main
+          git checkout upstream/main -- packages/linux projects/Generic
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: kernel-dv-ccache-${{ needs.check-and-sync.outputs.kernel_hash }}
+          restore-keys: |
+            kernel-dv-ccache-
+
+      - name: Install Kernel Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex libssl-dev libelf-dev libdw-dev \
+            debhelper dpkg-dev rsync kmod cpio pahole lsb-release \
+            ccache busybox-static skopeo xz-utils curl
+
+      - name: Login to Docker Hub (skopeo)
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | skopeo login docker.io -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Compile Kernel & Push Installer Image to Docker Hub
+        run: |
+          ccache -M 5G
+          ccache -z
+          chmod +x docker-dv/build-kernel-deb.sh docker-dv/build-kernel-installer.py
+          ./docker-dv/build-kernel-deb.sh \
+            "${{ needs.check-and-sync.outputs.kernel_hash }}" \
+            "${{ env.DOCKERHUB_REPO }}"
+          ccache -s
+
+      - name: Publish Kernel .deb Packages to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_TAG="kernel-dv-$(date -u +%Y%m%d)"
+          if gh release view "${RELEASE_TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" /tmp/kernel-build/out/*.deb --clobber --repo "${{ github.repository }}"
+          else
+            gh release create "${RELEASE_TAG}" /tmp/kernel-build/out/*.deb \
+              --repo "${{ github.repository }}" \
+              --title "LibreELEC Dolby Vision Host Kernel (${RELEASE_TAG})" \
+              --notes "Auto-built Debian/Ubuntu/FnOS host kernel packages (Intel & AMD supported) synchronized from upstream CroqueMr/libreelec-x86-DV."
+          fi
